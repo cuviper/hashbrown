@@ -79,6 +79,8 @@ mod external_trait_impls;
 mod map;
 #[cfg(feature = "rustc-internal-api")]
 mod rustc_entry;
+#[cfg(feature = "rustc-internal-api")]
+mod rustc_set_entry;
 mod scopeguard;
 mod set;
 
@@ -102,6 +104,9 @@ pub mod hash_map {
 pub mod hash_set {
     //! A hash set implemented as a `HashMap` where the value is `()`.
     pub use crate::set::*;
+
+    #[cfg(feature = "rustc-internal-api")]
+    pub use crate::rustc_set_entry::*;
 
     #[cfg(feature = "rayon")]
     /// [rayon]-based parallel iterator types for hash sets.
