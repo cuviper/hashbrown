@@ -268,12 +268,13 @@ where
             .map(|bucket| unsafe { bucket.as_mut() })
     }
 
-    /// Returns an `OccupiedEntry` for an entry in the table with the given hash
+    /// Returns a `FindEntry` for an entry in the table with the given hash
     /// and which satisfies the equality function passed.
     ///
-    /// This can be used to remove the entry from the table. Call
-    /// [`HashTable::entry`] instead if you wish to insert an entry if the
-    /// lookup fails.
+    /// This can be used to remove the entry from the table, or possibly insert
+    /// a new entry with the given hash if one doesn't already exist, without
+    /// growing to reserve a spot ahead of time. Call [`HashTable::entry`]
+    /// instead if you definitely wish to insert an entry if the lookup fails.
     ///
     /// This method will call `eq` for all entries with the given hash, but may
     /// also call it for entries with a different hash. `eq` should only return
@@ -285,6 +286,7 @@ where
     /// # #[cfg(feature = "nightly")]
     /// # fn test() {
     /// use ahash::AHasher;
+    /// use hashbrown::hash_table::FindEntry;
     /// use hashbrown::HashTable;
     /// use std::hash::{BuildHasher, BuildHasherDefault};
     ///
@@ -292,7 +294,7 @@ where
     /// let hasher = BuildHasherDefault::<AHasher>::default();
     /// let hasher = |val: &_| hasher.hash_one(val);
     /// table.insert_unchecked(hasher(&1), (1, "a"), |val| hasher(&val.0));
-    /// if let Ok(entry) = table.find_entry(hasher(&1), |val| val.0 == 1) {
+    /// if let FindEntry::Occupied(entry) = table.find_entry(hasher(&1), |val| val.0 == 1) {
     ///     entry.remove();
     /// }
     /// assert_eq!(table.find(hasher(&1), |val| val.0 == 1), None);
@@ -302,18 +304,15 @@ where
     /// #     test()
     /// # }
     /// ```
-    pub fn find_entry(
-        &mut self,
-        hash: u64,
-        eq: impl FnMut(&T) -> bool,
-    ) -> Result<OccupiedEntry<'_, T, A>, &mut Self> {
+    pub fn find_entry(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> FindEntry<'_, T, A> {
+        // TODO: add a way to find `Option<InsertSlot>` when missing? (without growing)
         match self.raw.find(hash, eq) {
-            Some(bucket) => Ok(OccupiedEntry {
+            Some(bucket) => FindEntry::Occupied(OccupiedEntry {
                 hash,
                 bucket,
                 table: self,
             }),
-            None => Err(self),
+            None => FindEntry::Absent(AbsentEntry { hash, table: self }),
         }
     }
 
@@ -1387,7 +1386,7 @@ where
 /// # #[cfg(feature = "nightly")]
 /// # fn test() {
 /// use ahash::AHasher;
-/// use hashbrown::hash_table::{Entry, HashTable, OccupiedEntry};
+/// use hashbrown::hash_table::{Entry, FindEntry, HashTable};
 /// use std::hash::{BuildHasher, BuildHasherDefault};
 ///
 /// let mut table = HashTable::new();
@@ -1398,7 +1397,7 @@ where
 /// }
 /// assert_eq!(table.len(), 3);
 ///
-/// let _entry_o: OccupiedEntry<_, _> = table.find_entry(hasher(&"a"), |&x| x == "a").unwrap();
+/// let FindEntry::Occupied(_) = table.find_entry(hasher(&"a"), |&x| x == "a") else { panic!() };
 /// assert_eq!(table.len(), 3);
 ///
 /// // Existing key
@@ -1646,7 +1645,7 @@ where
         unsafe { self.bucket.as_mut() }
     }
 
-    /// Converts the OccupiedEntry into a mutable reference to the underlying
+    /// Converts the `OccupiedEntry` into a mutable reference to the underlying
     /// table.
     pub fn into_table(self) -> &'a mut HashTable<T, A> {
         self.table
@@ -1756,7 +1755,414 @@ where
         }
     }
 
-    /// Converts the OccupiedEntry into a mutable reference to the underlying
+    /// Converts the `VacantEntry` into a mutable reference to the underlying
+    /// table.
+    pub fn into_table(self) -> &'a mut HashTable<T, A> {
+        self.table
+    }
+}
+
+/// A view into a single entry in a table, which may either be occupied or absent.
+///
+/// This `enum` is constructed from the [`find_entry`] method on [`HashTable`].
+///
+/// [`HashTable`]: struct.HashTable.html
+/// [`find_entry`]: struct.HashTable.html#method.find_entry
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "nightly")]
+/// # fn test() {
+/// use ahash::AHasher;
+/// use hashbrown::hash_table::{FindEntry, HashTable, OccupiedEntry};
+/// use std::hash::{BuildHasher, BuildHasherDefault};
+///
+/// let mut table = HashTable::new();
+/// let hasher = BuildHasherDefault::<AHasher>::default();
+/// let hasher = |val: &_| hasher.hash_one(val);
+/// for x in ["a", "b", "c"] {
+///     table.insert_unchecked(hasher(&x), x, hasher);
+/// }
+/// assert_eq!(table.len(), 3);
+///
+/// // Existing value (insert)
+/// let entry: FindEntry<_> = table.find_entry(hasher(&"a"), |&x| x == "a");
+/// let _raw_o: OccupiedEntry<_, _> = entry.insert("a", hasher);
+/// assert_eq!(table.len(), 3);
+/// // Nonexistent value (insert)
+/// table.find_entry(hasher(&"d"), |&x| x == "d").insert("d", hasher);
+///
+/// // Existing value (or_insert)
+/// table
+///     .find_entry(hasher(&"b"), |&x| x == "b")
+///     .or_insert("b", hasher);
+/// // Nonexistent value (or_insert)
+/// table
+///     .find_entry(hasher(&"e"), |&x| x == "e")
+///     .or_insert("e", hasher);
+///
+/// println!("Our HashTable: {:?}", table);
+///
+/// let mut vec: Vec<_> = table.iter().copied().collect();
+/// // The `Iter` iterator produces items in arbitrary order, so the
+/// // items must be sorted to test them against a sorted array.
+/// vec.sort_unstable();
+/// assert_eq!(vec, ["a", "b", "c", "d", "e"]);
+/// # }
+/// # fn main() {
+/// #     #[cfg(feature = "nightly")]
+/// #     test()
+/// # }
+/// ```
+pub enum FindEntry<'a, T, A = Global>
+where
+    A: Allocator,
+{
+    /// An occupied entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::hash_table::{FindEntry, HashTable, OccupiedEntry};
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    /// for x in ["a", "b"] {
+    ///     table.insert_unchecked(hasher(&x), x, hasher);
+    /// }
+    ///
+    /// match table.find_entry(hasher(&"a"), |&x| x == "a") {
+    ///     FindEntry::Absent(_) => unreachable!(),
+    ///     FindEntry::Occupied(_) => {}
+    /// }
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    Occupied(OccupiedEntry<'a, T, A>),
+
+    /// A vacant entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::hash_table::{FindEntry, HashTable, OccupiedEntry};
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table = HashTable::<&str>::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// match table.find_entry(hasher(&"a"), |&x| x == "a") {
+    ///     FindEntry::Absent(_) => {}
+    ///     FindEntry::Occupied(_) => unreachable!(),
+    /// }
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    Absent(AbsentEntry<'a, T, A>),
+}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for FindEntry<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            FindEntry::Occupied(ref o) => f.debug_tuple("FindEntry").field(o).finish(),
+            FindEntry::Absent(ref a) => f.debug_tuple("FindEntry").field(a).finish(),
+        }
+    }
+}
+
+impl<'a, T, A> FindEntry<'a, T, A>
+where
+    A: Allocator,
+{
+    /// Sets the value of the entry, replacing any existing value if there is
+    /// one, and returns an [`OccupiedEntry`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::HashTable;
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table: HashTable<&str> = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// let entry = table
+    ///     .find_entry(hasher(&"horseyland"), |&x| x == "horseyland")
+    ///     .insert("horseyland", hasher);
+    ///
+    /// assert_eq!(entry.get(), &"horseyland");
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    pub fn insert(self, value: T, hasher: impl Fn(&T) -> u64) -> OccupiedEntry<'a, T, A> {
+        match self {
+            FindEntry::Occupied(mut entry) => {
+                *entry.get_mut() = value;
+                entry
+            }
+            FindEntry::Absent(entry) => entry.insert(value, hasher),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting if it was vacant.
+    ///
+    /// Returns an [`OccupiedEntry`] pointing to the now-occupied entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::HashTable;
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table: HashTable<&str> = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// // nonexistent key
+    /// table
+    ///     .find_entry(hasher(&"poneyland"), |&x| x == "poneyland")
+    ///     .or_insert("poneyland", hasher);
+    /// assert!(table
+    ///     .find(hasher(&"poneyland"), |&x| x == "poneyland")
+    ///     .is_some());
+    ///
+    /// // existing key
+    /// table
+    ///     .find_entry(hasher(&"poneyland"), |&x| x == "poneyland")
+    ///     .or_insert("poneyland", hasher);
+    /// assert!(table
+    ///     .find(hasher(&"poneyland"), |&x| x == "poneyland")
+    ///     .is_some());
+    /// assert_eq!(table.len(), 1);
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    pub fn or_insert(self, default: T, hasher: impl Fn(&T) -> u64) -> OccupiedEntry<'a, T, A> {
+        match self {
+            FindEntry::Occupied(entry) => entry,
+            FindEntry::Absent(entry) => entry.insert(default, hasher),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty..
+    ///
+    /// Returns an [`OccupiedEntry`] pointing to the now-occupied entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::HashTable;
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table: HashTable<String> = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// table
+    ///     .find_entry(hasher("poneyland"), |x| x == "poneyland")
+    ///     .or_insert_with(|| "poneyland".to_string(), |val| hasher(val));
+    ///
+    /// assert!(table
+    ///     .find(hasher(&"poneyland"), |x| x == "poneyland")
+    ///     .is_some());
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    pub fn or_insert_with(
+        self,
+        default: impl FnOnce() -> T,
+        hasher: impl Fn(&T) -> u64,
+    ) -> OccupiedEntry<'a, T, A> {
+        match self {
+            FindEntry::Occupied(entry) => entry,
+            FindEntry::Absent(entry) => entry.insert(default(), hasher),
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any
+    /// potential inserts into the table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::HashTable;
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table: HashTable<(&str, u32)> = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// table
+    ///     .find_entry(hasher(&"poneyland"), |&(x, _)| x == "poneyland")
+    ///     .and_modify(|(_, v)| *v += 1)
+    ///     .or_insert(("poneyland", 42), |(k, _)| hasher(&k));
+    /// assert_eq!(
+    ///     table.find(hasher(&"poneyland"), |&(k, _)| k == "poneyland"),
+    ///     Some(&("poneyland", 42))
+    /// );
+    ///
+    /// table
+    ///     .find_entry(hasher(&"poneyland"), |&(x, _)| x == "poneyland")
+    ///     .and_modify(|(_, v)| *v += 1)
+    ///     .or_insert(("poneyland", 42), |(k, _)| hasher(&k));
+    /// assert_eq!(
+    ///     table.find(hasher(&"poneyland"), |&(k, _)| k == "poneyland"),
+    ///     Some(&("poneyland", 43))
+    /// );
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    pub fn and_modify(self, f: impl FnOnce(&mut T)) -> Self {
+        match self {
+            FindEntry::Occupied(mut entry) => {
+                f(entry.get_mut());
+                FindEntry::Occupied(entry)
+            }
+            FindEntry::Absent(entry) => FindEntry::Absent(entry),
+        }
+    }
+}
+
+/// A view into a missing entry in a `HashTable`.
+/// It is part of the [`FindEntry`] enum.
+///
+/// [`FindEntry`]: enum.FindEntry.html
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "nightly")]
+/// # fn test() {
+/// use ahash::AHasher;
+/// use hashbrown::hash_table::{FindEntry, HashTable, AbsentEntry};
+/// use std::hash::{BuildHasher, BuildHasherDefault};
+///
+/// let mut table: HashTable<&str> = HashTable::new();
+/// let hasher = BuildHasherDefault::<AHasher>::default();
+/// let hasher = |val: &_| hasher.hash_one(val);
+///
+/// let entry_v: AbsentEntry<_, _> = match table.find_entry(hasher(&"a"), |&x| x == "a") {
+///     FindEntry::Absent(view) => view,
+///     FindEntry::Occupied(_) => unreachable!(),
+/// };
+/// entry_v.insert("a", hasher);
+/// assert!(table.find(hasher(&"a"), |&x| x == "a").is_some() && table.len() == 1);
+///
+/// // Nonexistent key (insert)
+/// match table.find_entry(hasher(&"b"), |&x| x == "b") {
+///     FindEntry::Absent(view) => {
+///         view.insert("b", hasher);
+///     }
+///     FindEntry::Occupied(_) => unreachable!(),
+/// }
+/// assert!(table.find(hasher(&"b"), |&x| x == "b").is_some() && table.len() == 2);
+/// # }
+/// # fn main() {
+/// #     #[cfg(feature = "nightly")]
+/// #     test()
+/// # }
+/// ```
+pub struct AbsentEntry<'a, T, A = Global>
+where
+    A: Allocator,
+{
+    hash: u64,
+    table: &'a mut HashTable<T, A>,
+}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for AbsentEntry<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AbsentEntry")
+    }
+}
+
+impl<'a, T, A> AbsentEntry<'a, T, A>
+where
+    A: Allocator,
+{
+    /// Inserts a new element into the table with the hash that was used to
+    /// obtain the `AbsentEntry`.
+    ///
+    /// An `OccupiedEntry` is returned for the newly inserted element.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "nightly")]
+    /// # fn test() {
+    /// use ahash::AHasher;
+    /// use hashbrown::hash_table::Entry;
+    /// use hashbrown::HashTable;
+    /// use std::hash::{BuildHasher, BuildHasherDefault};
+    ///
+    /// let mut table: HashTable<&str> = HashTable::new();
+    /// let hasher = BuildHasherDefault::<AHasher>::default();
+    /// let hasher = |val: &_| hasher.hash_one(val);
+    ///
+    /// if let Entry::Vacant(o) = table.entry(hasher(&"poneyland"), |&x| x == "poneyland", hasher) {
+    ///     o.insert("poneyland");
+    /// }
+    /// assert_eq!(
+    ///     table.find(hasher(&"poneyland"), |&x| x == "poneyland"),
+    ///     Some(&"poneyland")
+    /// );
+    /// # }
+    /// # fn main() {
+    /// #     #[cfg(feature = "nightly")]
+    /// #     test()
+    /// # }
+    /// ```
+    pub fn insert(self, value: T, hasher: impl Fn(&T) -> u64) -> OccupiedEntry<'a, T, A> {
+        let bucket = self.table.raw.insert(self.hash, value, hasher);
+        OccupiedEntry {
+            hash: self.hash,
+            bucket,
+            table: self.table,
+        }
+    }
+
+    /// Converts the `AbsentEntry` into a mutable reference to the underlying
     /// table.
     pub fn into_table(self) -> &'a mut HashTable<T, A> {
         self.table
